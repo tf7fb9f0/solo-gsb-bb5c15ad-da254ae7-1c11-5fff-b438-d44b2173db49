@@ -19,7 +19,9 @@ const state = {
   timerHandle: null,
   // 换位邀请：swapId -> 最近已知状态（用于检测状态变化并弹出反馈）
   swapSeeded: false,
-  swapStatus: new Map()
+  swapStatus: new Map(),
+  // 安全撤销：最近一次已展示的撤销状态（用于检测可用/失效/已撤销的跳变）
+  undoSeen: null
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -52,6 +54,7 @@ const els = {
   queueList: $('#queue-list'),
   queueEmpty: $('#queue-empty'),
   queueCount: $('#queue-count'),
+  undoBar: $('#undo-bar'),
   swapBar: $('#swap-bar'),
   btnRequest: $('#btn-request'),
   btnCancel: $('#btn-cancel'),
@@ -201,6 +204,7 @@ function enterRoom(creds) {
   state.version = 0;
   state.swapSeeded = false;
   state.swapStatus = new Map();
+  state.undoSeen = null;
   state.intentionalClose = false;
   state.reconnectDelay = 500;
 
@@ -300,9 +304,10 @@ function handleMessage(msg) {
   switch (msg.type) {
     case 'joined': {
       state.me = msg.you;
-      // 首次快照只播种状态，不把重连前已存在的邀请当成新变化弹提示
+      // 首次快照只播种状态，不把重连前已存在的邀请/撤销状态当成新变化弹提示
       state.swapSeeded = false;
       state.swapStatus = new Map();
+      state.undoSeen = null;
       // 持久化身份，供断线/刷新后恢复
       const creds = state.creds;
       creds.id = msg.you.id;
@@ -350,7 +355,48 @@ function applySnapshot(snap) {
   state.clockOffset = snap.serverTs - Date.now();
   els.versionBadge.textContent = `v${snap.version}`;
   processSwaps(snap);
+  processUndo(snap);
   render();
+}
+
+// ---------------------------------------------------------------------------
+// 安全撤销：按快照展示可撤销操作摘要或失效原因
+// ---------------------------------------------------------------------------
+
+const UNDO_OP_TEXT = {
+  reorder: '调整发言顺序',
+  remove: '移出队列',
+  start_speaking: '请其开始发言',
+  end_speaking: '结束发言'
+};
+
+/** 生成撤销状态的本地签名，用于检测跳变，避免重复弹提示 */
+function undoSignature(u) {
+  if (!u) return 'none';
+  return `${u.op}:${u.status}:${u.version}:${u.reason || ''}`;
+}
+
+function processUndo(snap) {
+  const u = snap.undo || null;
+  const sig = undoSignature(u);
+  if (state.undoSeen === null) {
+    // 首次快照（含重连）只播种，不提示
+    state.undoSeen = sig;
+    return;
+  }
+  if (sig === state.undoSeen) return;
+  const prev = state.undoSeen;
+  state.undoSeen = sig;
+
+  if (u && u.status === 'invalid' && prev !== 'none' && !prev.endsWith(':invalid:' + (u.reason || ''))) {
+    // 可撤销操作因介入变更而失效
+    toast(`撤销已失效：${u.reasonText || '房间状态出现新的变更'}`, 'error');
+  } else if (!u && prev !== 'none') {
+    // 撤销被成功消费（或被一键清空等整体重置）
+    toast('已撤销最近一次主持人操作', 'success');
+  } else if (u && u.status === 'available' && prev === 'none') {
+    toast(`可撤销：${u.summary || UNDO_OP_TEXT[u.op] || '主持人操作'}`, 'info');
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -426,6 +472,7 @@ function render() {
   if (!snap) return;
   renderStage(snap);
   renderQueue(snap);
+  renderUndoBar(snap);
   renderSwapBar(snap);
   renderLogs(snap);
   renderPeople(snap);
@@ -541,6 +588,45 @@ function renderQueue(snap) {
 }
 
 /**
+ * 安全撤销条：展示最近一次主持人操作的结构化摘要，
+ * 可一键撤销；若已被介入变更作废则展示失效原因（按钮禁用）。
+ */
+function renderUndoBar(snap) {
+  const bar = els.undoBar;
+  const u = snap.undo;
+  bar.textContent = '';
+  if (!state.me || !state.me.host || !u) {
+    bar.hidden = true;
+    return;
+  }
+  bar.hidden = false;
+  bar.classList.toggle('undo-invalid', u.status === 'invalid');
+
+  const main = document.createElement('span');
+  main.className = 'undo-main';
+  const opText = UNDO_OP_TEXT[u.op] || '主持人操作';
+  if (u.status === 'available') {
+    const time = formatTime(u.ts);
+    main.innerHTML =
+      `<span class="undo-tag">可撤销</span>` +
+      `<span class="undo-summary">${escapeHtml(u.summary || opText)}</span>` +
+      `<span class="undo-meta">${time} · v${u.version} 之后的任何变更都会使其失效</span>`;
+    const btn = document.createElement('button');
+    btn.className = 'btn btn-mini';
+    btn.type = 'button';
+    btn.dataset.act = 'undo-host';
+    btn.textContent = '↩ 撤销';
+    bar.appendChild(main);
+    bar.appendChild(btn);
+  } else {
+    main.innerHTML =
+      `<span class="undo-tag undo-tag-dead">已失效</span>` +
+      `<span class="undo-summary">${escapeHtml(opText)}：${escapeHtml(u.reasonText || '房间状态出现新的变更')}</span>`;
+    bar.appendChild(main);
+  }
+}
+
+/**
  * 协商换位状态卡：分别展示「我发起的」与「我收到的」待处理邀请，
  * 提供接受 / 拒绝 / 撤回操作。普通参与者视图可见。
  */
@@ -642,6 +728,13 @@ els.btnClearAll.addEventListener('click', () => {
 els.btnClearLogs.addEventListener('click', () => {
   if (!confirm('确定清空操作记录？')) return;
   sendCmd({ type: 'clear_logs' });
+});
+
+// 安全撤销条：撤销最近一次主持人操作（版本冲突仍走 STALE_VERSION 流程）
+els.undoBar.addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-act="undo-host"]');
+  if (!btn || btn.disabled) return;
+  sendCmd({ type: 'undo_host' });
 });
 
 // 队列条目：开始发言 / 移出 / 发起换位邀请

@@ -104,6 +104,69 @@ class Client {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 安全撤销测试辅助：独立房间，避免干扰主流程
+// ---------------------------------------------------------------------------
+
+async function createRoom(nick) {
+  const created = await postJSON('/api/rooms', { nick: nick || '主持' });
+  assert.strictEqual(created.status, 200);
+  return created.body;
+}
+
+async function hostJoin(created, nick) {
+  const c = new Client();
+  await c.open();
+  c.send({
+    type: 'join',
+    room: created.room,
+    nick: nick || '主持',
+    participantId: created.participantId,
+    hostToken: created.hostToken
+  });
+  await c.waitFor((x) => x.joined && x.joined.you.host === true);
+  return c;
+}
+
+async function guestJoin(code, nick) {
+  const c = new Client();
+  await c.open();
+  c.send({ type: 'join', room: code, nick });
+  await c.waitFor((x) => x.joined && x.joined.you.nick === nick);
+  return c;
+}
+
+/** 主持人执行一条版本化命令并等待版本推进 */
+async function hostCmd(host, cmd) {
+  const v = host.v;
+  host.lastError = null;
+  host.send(Object.assign({ version: host.v }, cmd));
+  await host.waitFor((c) => c.v === v + 1 || (c.lastError && c.lastError.code === 'STALE_VERSION'));
+}
+
+/**
+ * 等待房间版本稳定：host 的 join 提交会在 guest join 之后再广播一个快照，
+ * guest 需等到该快照到达，否则其首条命令会被判为 STALE_VERSION。
+ */
+async function waitStable(host, clients, ms = 150) {
+  const v = host.v;
+  await new Promise((r) => setTimeout(r, ms));
+  for (const c of clients) {
+    await c.waitFor((x) => x.v === host.v && x.v >= v);
+  }
+}
+
+/** 以 guest 视角发送版本化命令：先同步到主持人的最新版本，避免 STALE_VERSION 干扰断言 */
+async function guestSend(host, guest, cmd) {
+  await waitStable(host, [guest]);
+  guest.lastError = null;
+  guest.send(Object.assign({ version: guest.v }, cmd));
+}
+
+async function waitForUndo(host, predicate) {
+  await host.waitFor((c) => c.snapshot.undo && predicate(c.snapshot.undo));
+}
+
 async function main() {
   await startServer();
 
@@ -393,6 +456,329 @@ async function main() {
   await bob2.waitFor((c) => c.lastError && c.lastError.code === 'NO_SWAP');
 
   await dave.close();
+
+  // ===========================================================================
+  // 安全撤销（四类逆操作 + 介入变更边界）
+  // ===========================================================================
+
+  // 16. reorder 逆操作：恢复拖动前队列
+  {
+    const created = await createRoom('撤销主持');
+    const h = await hostJoin(created);
+    const g1 = await guestJoin(created.room, '阿甲');
+    const g2 = await guestJoin(created.room, '阿乙');
+    const g3 = await guestJoin(created.room, '阿丙');
+    const id1 = g1.joined.you.id;
+    const id2 = g2.joined.you.id;
+    const id3 = g3.joined.you.id;
+
+    await waitStable(h, [g1, g2, g3]);
+    g1.send({ type: 'request_speak', version: g1.v });
+    await h.waitFor((c) => c.snapshot.order.length === 1);
+    g2.send({ type: 'request_speak', version: g2.v });
+    await h.waitFor((c) => c.snapshot.order.length === 2);
+    g3.send({ type: 'request_speak', version: g3.v });
+    await h.waitFor((c) => c.snapshot.order.length === 3);
+    assert.deepStrictEqual(h.snapshot.order, [id1, id2, id3]);
+
+    const vBefore = h.v;
+    await hostCmd(h, { type: 'reorder', order: [id3, id1, id2] });
+    assert.deepStrictEqual(h.snapshot.order, [id3, id1, id2]);
+    // 快照展示可撤销操作摘要
+    await waitForUndo(h, (u) => u.status === 'available' && u.op === 'reorder');
+    assert.strictEqual(h.snapshot.undo.version, vBefore + 1, '撤销锚点为操作提交后的版本');
+    assert.match(h.snapshot.undo.summary, /顺序/);
+    assert.strictEqual(h.snapshot.undo.reason, null);
+
+    // 撤销 -> 队列原子恢复，undo 清空，追加 audit 记录
+    const vUndo = h.v;
+    h.send({ type: 'undo_host', version: vUndo });
+    await h.waitFor((c) => c.v === vUndo + 1);
+    assert.deepStrictEqual(h.snapshot.order, [id1, id2, id3]);
+    assert.strictEqual(h.snapshot.undo, null);
+    assert.ok(h.snapshot.logs.some((l) => l.kind === 'audit' && /恢复.*顺序/.test(l.text)),
+      '撤销需追加可见审计记录');
+
+    // 撤销后再次撤销 -> UNDO_NONE，版本不变
+    h.lastError = null;
+    h.send({ type: 'undo_host', version: h.v });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'UNDO_NONE');
+    assert.ok(h.lastError.snapshot, '错误应附带最新快照');
+
+    // 拖动排序后出现介入变更（新成员申请发言）-> 撤销立即失效
+    await hostCmd(h, { type: 'reorder', order: [id2, id3, id1] });
+    await waitForUndo(h, (u) => u.status === 'available');
+    const staleV = h.v;
+    await guestSend(h, g1, { type: 'cancel_speak' });
+    await h.waitFor((c) => c.snapshot.undo && c.snapshot.undo.status === 'invalid');
+    assert.strictEqual(h.snapshot.undo.op, 'reorder');
+    assert.strictEqual(h.snapshot.undo.reason, 'queue_changed');
+    assert.ok(h.snapshot.undo.reasonText, '失效需带可读原因');
+
+    // 失效后撤销 -> UNDO_INVALIDATED，不产生新版本
+    h.lastError = null;
+    h.send({ type: 'undo_host', version: h.v });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'UNDO_INVALIDATED');
+    assert.strictEqual(h.lastError.snapshot.version, staleV + 1);
+    assert.strictEqual(h.v, staleV + 1, '失效撤销不得改变版本');
+
+    // 用过期版本撤销 -> STALE_VERSION + 最新快照
+    h.lastError = null;
+    h.send({ type: 'undo_host', version: staleV - 1 });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'STALE_VERSION');
+    assert.strictEqual(h.lastError.snapshot.version, h.snapshot.version);
+
+    // 非主持人不能撤销
+    await guestSend(h, g2, { type: 'undo_host' });
+    await g2.waitFor((c) => c.lastError && c.lastError.code === 'FORBIDDEN');
+
+    await h.close(); await g1.close(); await g2.close(); await g3.close();
+  }
+
+  // 17. remove 逆操作：恢复队列位置；正在发言的成员恢复发言且 startedAt 保留
+  {
+    const created = await createRoom();
+    const h = await hostJoin(created);
+    const g1 = await guestJoin(created.room, '阿猫');
+    const g2 = await guestJoin(created.room, '阿狗');
+    const id1 = g1.joined.you.id;
+    const id2 = g2.joined.you.id;
+
+    await waitStable(h, [g1, g2]);
+    g1.send({ type: 'request_speak', version: g1.v });
+    await h.waitFor((c) => c.snapshot.order.length === 1);
+    g2.send({ type: 'request_speak', version: g2.v });
+    await h.waitFor((c) => c.snapshot.order.length === 2);
+
+    // 移出队首 -> 撤销恢复到原下标
+    await hostCmd(h, { type: 'remove', participantId: id1 });
+    assert.deepStrictEqual(h.snapshot.order, [id2]);
+    await waitForUndo(h, (u) => u.status === 'available' && u.op === 'remove');
+    assert.match(h.snapshot.undo.summary, /阿猫/);
+    // 成员席位与在线状态不受影响
+    const p1 = h.snapshot.participants.find((p) => p.id === id1);
+    assert.ok(p1, '移出队列不得删除成员席位');
+
+    h.send({ type: 'undo_host', version: h.v });
+    await h.waitFor((c) => c.snapshot.order.length === 2);
+    assert.deepStrictEqual(h.snapshot.order, [id1, id2], '应恢复到原队列位置');
+    assert.strictEqual(h.snapshot.undo, null);
+
+    // 移出正在发言者 -> 撤销恢复发言，startedAt 不变
+    await hostCmd(h, { type: 'start_speaking', participantId: id1 });
+    const startedAt = h.snapshot.speaking.startedAt;
+    assert.ok(h.snapshot.speaking && h.snapshot.speaking.id === id1);
+    await hostCmd(h, { type: 'remove', participantId: id1 });
+    assert.strictEqual(h.snapshot.speaking, null);
+    h.send({ type: 'undo_host', version: h.v });
+    await h.waitFor((c) => c.snapshot.speaking && c.snapshot.speaking.id === id1);
+    assert.strictEqual(h.snapshot.speaking.startedAt, startedAt, '撤销恢复发言须保留原计时起点');
+
+    // 移出后有新介入（他人申请）-> 撤销失效
+    await hostCmd(h, { type: 'remove', participantId: id2 });
+    assert.deepStrictEqual(h.snapshot.order, []);
+    await guestSend(h, g2, { type: 'request_speak' });
+    await h.waitFor((c) => c.snapshot.undo && c.snapshot.undo.status === 'invalid');
+    assert.strictEqual(h.snapshot.undo.reason, 'queue_changed');
+    h.lastError = null;
+    h.send({ type: 'undo_host', version: h.v });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'UNDO_INVALIDATED');
+    assert.deepStrictEqual(h.snapshot.order, [id2], '失效撤销不得改动队列');
+
+    await h.close(); await g1.close(); await g2.close();
+  }
+
+  // 18. start_speaking 逆操作：发言人回到原队列位置，并恢复之前的发言人
+  {
+    const created = await createRoom();
+    const h = await hostJoin(created);
+    const g1 = await guestJoin(created.room, '阿东');
+    const g2 = await guestJoin(created.room, '阿西');
+    const id1 = g1.joined.you.id;
+    const id2 = g2.joined.you.id;
+
+    await waitStable(h, [g1, g2]);
+    await guestSend(h, g1, { type: 'request_speak' });
+    await h.waitFor((c) => c.snapshot.order.length === 1);
+    await guestSend(h, g2, { type: 'request_speak' });
+    await h.waitFor((c) => c.snapshot.order.length === 2);
+
+    // 请队首发言：从队列移除
+    await hostCmd(h, { type: 'start_speaking', participantId: id1 });
+    assert.deepStrictEqual(h.snapshot.order, [id2]);
+    assert.strictEqual(h.snapshot.speaking.id, id1);
+    await waitForUndo(h, (u) => u.status === 'available' && u.op === 'start_speaking');
+
+    h.send({ type: 'undo_host', version: h.v });
+    await h.waitFor((c) => c.snapshot.speaking === null);
+    assert.deepStrictEqual(h.snapshot.order, [id1, id2], '撤销后发言人回到原队列位置');
+    assert.strictEqual(h.snapshot.undo, null);
+
+    // 带「切换发言人」语义：id1 发言中，请 id2 发言（自动结束 id1），撤销应恢复 id1 与计时
+    await hostCmd(h, { type: 'start_speaking', participantId: id1 });
+    const firstStartedAt = h.snapshot.speaking.startedAt;
+    await h.waitFor((c) => c.snapshot.order.length === 1);
+    await hostCmd(h, { type: 'start_speaking', participantId: id2 });
+    assert.strictEqual(h.snapshot.speaking.id, id2);
+    assert.deepStrictEqual(h.snapshot.order, []);
+    h.send({ type: 'undo_host', version: h.v });
+    await h.waitFor((c) => c.snapshot.speaking && c.snapshot.speaking.id === id1);
+    assert.strictEqual(h.snapshot.speaking.startedAt, firstStartedAt, '原发言人计时连续');
+    assert.deepStrictEqual(h.snapshot.order, [id2], '新发言人回到原队列位置');
+
+    await h.close(); await g1.close(); await g2.close();
+  }
+
+  // 19. end_speaking 逆操作：恢复当前发言，startedAt 保持连续
+  {
+    const created = await createRoom();
+    const h = await hostJoin(created);
+    const g1 = await guestJoin(created.room, '阿南');
+    const id1 = g1.joined.you.id;
+
+    await waitStable(h, [g1]);
+    await guestSend(h, g1, { type: 'request_speak' });
+    await h.waitFor((c) => c.snapshot.order.length === 1);
+    await hostCmd(h, { type: 'start_speaking', participantId: id1 });
+    const startedAt = h.snapshot.speaking.startedAt;
+
+    await hostCmd(h, { type: 'end_speaking' });
+    assert.strictEqual(h.snapshot.speaking, null);
+    await waitForUndo(h, (u) => u.status === 'available' && u.op === 'end_speaking');
+
+    h.send({ type: 'undo_host', version: h.v });
+    await h.waitFor((c) => c.snapshot.speaking && c.snapshot.speaking.id === id1);
+    assert.strictEqual(h.snapshot.speaking.startedAt, startedAt, '恢复发言须沿用原 startedAt');
+    assert.ok(h.snapshot.logs.some((l) => l.kind === 'audit' && /计时连续/.test(l.text)));
+
+    await h.close(); await g1.close();
+  }
+
+  // 20. 介入变更边界：仅保留最近一次主持人操作；成员/换位/清空/一键清空均使撤销失效
+  {
+    const created = await createRoom();
+    const h = await hostJoin(created);
+    const g1 = await guestJoin(created.room, '阿春');
+    const g2 = await guestJoin(created.room, '阿夏');
+    const g3 = await guestJoin(created.room, '阿秋');
+    const id1 = g1.joined.you.id;
+    const id2 = g2.joined.you.id;
+    const id3 = g3.joined.you.id;
+
+    await waitStable(h, [g1, g2, g3]);
+    await guestSend(h, g1, { type: 'request_speak' });
+    await h.waitFor((c) => c.snapshot.order.length === 1);
+    await guestSend(h, g2, { type: 'request_speak' });
+    await h.waitFor((c) => c.snapshot.order.length === 2);
+    await guestSend(h, g3, { type: 'request_speak' });
+    await h.waitFor((c) => c.snapshot.order.length === 3);
+
+    // 连续两次主持人操作：只保留最近一次（旧的不可再撤销）
+    await hostCmd(h, { type: 'reorder', order: [id2, id1, id3] });
+    await waitForUndo(h, (u) => u.status === 'available' && u.op === 'reorder');
+    await hostCmd(h, { type: 'reorder', order: [id2, id3, id1] });
+    assert.strictEqual(h.snapshot.undo.op, 'reorder');
+    h.send({ type: 'undo_host', version: h.v });
+    await h.waitFor((c) => c.snapshot.undo === null);
+    assert.deepStrictEqual(h.snapshot.order, [id2, id1, id3], '撤销只能回退到最近一次操作之前');
+    assert.notDeepStrictEqual(h.snapshot.order, [id1, id2, id3], '不允许连续撤销多步');
+
+    // 成员加入/断线/离开均属于版本化状态变更，撤销立即失效
+    await hostCmd(h, { type: 'reorder', order: [id1, id3, id2] });
+    await waitForUndo(h, (u) => u.status === 'available');
+    const g4 = await guestJoin(created.room, '阿冬');
+    await h.waitFor((c) => c.snapshot.undo && c.snapshot.undo.status === 'invalid');
+    assert.strictEqual(h.snapshot.undo.reason, 'presence_changed');
+    await g4.close();
+    // 等待服务端处理完断线提交后再继续，避免主持人命令踩中过期版本
+    await h.waitFor((c) => {
+      const p = c.snapshot.participants.find((x) => x.nick === '阿冬');
+      return p && p.online === false;
+    });
+
+    // 换位状态变更同样使撤销失效
+    await hostCmd(h, { type: 'reorder', order: [id3, id1, id2] });
+    await waitForUndo(h, (u) => u.status === 'available');
+    await guestSend(h, g1, { type: 'swap_invite', participantId: id2 });
+    await h.waitFor((c) => c.snapshot.undo && c.snapshot.undo.status === 'invalid');
+    assert.strictEqual(h.snapshot.undo.reason, 'swap_changed');
+
+    // 一键清空使撤销立即失效并注明原因（clear 本身不可撤销）
+    await hostCmd(h, { type: 'reorder', order: [id3, id2, id1] });
+    await waitForUndo(h, (u) => u.status === 'available');
+    await hostCmd(h, { type: 'clear' });
+    assert.strictEqual(h.snapshot.undo.status, 'invalid', '一键清空使撤销失效');
+    assert.strictEqual(h.snapshot.undo.reason, 'cleared');
+    h.lastError = null;
+    h.send({ type: 'undo_host', version: h.v });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'UNDO_INVALIDATED');
+
+    // 清空记录（日志变更）也使挂起撤销失效
+    await guestSend(h, g1, { type: 'request_speak' });
+    await h.waitFor((c) => c.snapshot.order.length === 1);
+    await hostCmd(h, { type: 'remove', participantId: id1 });
+    await waitForUndo(h, (u) => u.status === 'available');
+    await hostCmd(h, { type: 'clear_logs' });
+    assert.strictEqual(h.snapshot.undo.status, 'invalid');
+    assert.strictEqual(h.snapshot.undo.reason, 'logs_cleared');
+
+    await h.close(); await g1.close(); await g2.close(); await g3.close();
+  }
+
+  // 21. 撤销边界：不回滚在线状态与身份凭证；审计记录独立可见
+  {
+    const created = await createRoom();
+    const h = await hostJoin(created);
+    const g1 = await guestJoin(created.room, '阿梅');
+    const g2 = await guestJoin(created.room, '阿兰');
+    const id1 = g1.joined.you.id;
+    const id2 = g2.joined.you.id;
+    const secret2 = g2.joined.you.secret;
+
+    await waitStable(h, [g1, g2]);
+    await guestSend(h, g1, { type: 'request_speak' });
+    await h.waitFor((c) => c.snapshot.order.length === 1);
+    await guestSend(h, g2, { type: 'request_speak' });
+    await h.waitFor((c) => c.snapshot.order.length === 2);
+
+    // 主持人移出 g2 后，g2 断线；撤销恢复队列位置但保持离线
+    await hostCmd(h, { type: 'remove', participantId: id2 });
+    assert.deepStrictEqual(h.snapshot.order, [id1]);
+    await g2.close();
+    await h.waitFor((c) => {
+      const p = c.snapshot.participants.find((x) => x.id === id2);
+      return p && p.online === false;
+    });
+    // 注意：断线本身是版本化变更，已使撤销失效，主持人无法借撤销回滚在线状态
+    assert.strictEqual(h.snapshot.undo.status, 'invalid');
+    assert.strictEqual(h.snapshot.undo.reason, 'presence_changed');
+    // 身份凭证仍然有效：g2 可凭原 id+secret 重连，席位仍在
+    const g2b = new Client();
+    await g2b.open();
+    g2b.send({ type: 'join', room: created.room, nick: '阿兰', participantId: id2, secret: secret2 });
+    await g2b.waitFor((c) => c.joined && c.joined.you.id === id2);
+    const still = g2b.snapshot.participants.find((p) => p.id === id2);
+    assert.ok(still && still.online === true);
+    assert.ok(!g2b.snapshot.order.includes(id2), '失效撤销没有恢复队列位置');
+
+    // 审计记录不参与撤销：成功撤销产生的 audit 日志在后续操作后依然保留
+    // 构造一次成功撤销并验证审计独立
+    await guestSend(h, g2b, { type: 'request_speak' });
+    await h.waitFor((c) => c.snapshot.order.length === 2);
+    await hostCmd(h, { type: 'reorder', order: [id2, id1] });
+    h.send({ type: 'undo_host', version: h.v });
+    await h.waitFor((c) => c.snapshot.undo === null);
+    const auditCount = h.snapshot.logs.filter((l) => l.kind === 'audit').length;
+    await guestSend(h, g1, { type: 'cancel_speak' });
+    await h.waitFor((c) => c.snapshot.order.length === 1);
+    assert.strictEqual(
+      h.snapshot.logs.filter((l) => l.kind === 'audit').length,
+      auditCount,
+      '后续变更不得删除既有审计记录'
+    );
+
+    await h.close(); await g1.close(); await g2b.close();
+  }
 
   // 15. 房间不存在
   const ghost = new Client();
