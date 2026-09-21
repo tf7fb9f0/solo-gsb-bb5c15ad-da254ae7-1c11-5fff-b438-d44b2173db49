@@ -53,6 +53,7 @@ const els = {
   queueEmpty: $('#queue-empty'),
   queueCount: $('#queue-count'),
   swapBar: $('#swap-bar'),
+  undoBar: $('#undo-bar'),
   btnRequest: $('#btn-request'),
   btnCancel: $('#btn-cancel'),
   logList: $('#log-list'),
@@ -427,6 +428,7 @@ function render() {
   renderStage(snap);
   renderQueue(snap);
   renderSwapBar(snap);
+  renderUndo(snap);
   renderLogs(snap);
   renderPeople(snap);
 }
@@ -585,6 +587,33 @@ function renderSwapBar(snap) {
   }
 }
 
+/**
+ * 安全撤销条（仅主持人）：按快照展示最近一次可撤销操作的摘要，
+ * 或该操作已失效的原因。可撤销时提供撤销按钮。
+ */
+function renderUndo(snap) {
+  els.undoBar.textContent = '';
+  if (!state.me || !state.me.host) return;
+  const undo = snap.undo;
+  if (!undo) return;
+
+  const card = document.createElement('div');
+  if (undo.available) {
+    card.className = 'undo-card';
+    card.innerHTML = `
+      <span class="undo-desc">最近操作：${escapeHtml(undo.summary)}</span>
+      <button class="btn btn-ghost btn-mini" data-undo="1" title="撤销该操作，恢复此前的队列与发言状态">↩︎ 撤销</button>
+    `;
+  } else {
+    card.className = 'undo-card is-stale';
+    card.innerHTML = `
+      <span class="undo-desc">最近操作：${escapeHtml(undo.summary)}</span>
+      <span class="undo-stale">无法撤销：${escapeHtml(undo.reason || '已有新的状态变更')}</span>
+    `;
+  }
+  els.undoBar.appendChild(card);
+}
+
 function renderLogs(snap) {
   els.logList.textContent = '';
   // 最新的在最上面
@@ -669,6 +698,11 @@ els.swapBar.addEventListener('click', (e) => {
   if (act === 'accept') sendCmd({ type: 'swap_accept', swapId });
   else if (act === 'reject') sendCmd({ type: 'swap_reject', swapId });
   else if (act === 'cancel') sendCmd({ type: 'swap_cancel', swapId });
+});
+
+// 安全撤销：撤销最近一次可撤销的主持人操作
+els.undoBar.addEventListener('click', (e) => {
+  if (e.target.closest('[data-undo]')) sendCmd({ type: 'undo' });
 });
 
 // ---------------------------------------------------------------------------

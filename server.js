@@ -19,6 +19,7 @@
  *   { type: "remove",         version, participantId }  // 主持人
  *   { type: "clear",          version }                 // 主持人：一键清空
  *   { type: "clear_logs",     version }                 // 主持人：仅清空操作记录
+ *   { type: "undo",           version }                 // 主持人：撤销最近一次可撤销操作
  *
  * 服务端 -> 客户端
  *   { type: "joined",  snapshot, you:{id,secret,host} }
@@ -70,6 +71,12 @@ app.use(express.static(path.join(__dirname, 'public')));
  *     reason, ts, resolvedAt
  *   }],
  *   logs: [{id, ts, kind, text}],
+ *   undo: null | {           // 最近一次可撤销的主持人操作（安全撤销）
+ *     version,               // 操作完成后的版本；此后任何版本化变更使其失效
+ *     summary,               // 操作摘要（随快照下发，客户端展示）
+ *     inverse: { order, speaking: {id, elapsedMs} | null },  // 结构化逆操作
+ *     stale, staleReason     // 失效标记与原因
+ *   },
  *   createdAt, lastSeen
  * }
  */
@@ -86,6 +93,7 @@ function newRoom(code) {
     speaking: null,
     swaps: new Map(),
     logs: [],
+    undo: null,
     createdAt: Date.now(),
     lastSeen: Date.now()
   };
@@ -226,6 +234,14 @@ function buildSnapshot(room) {
       ts: s.ts,
       resolvedAt: s.resolvedAt || null
     })),
+    // 安全撤销：可撤销时给出操作摘要，失效时给出原因，无记录时为 null
+    undo: room.undo
+      ? {
+          summary: room.undo.summary,
+          available: !room.undo.stale && room.undo.version === room.version,
+          reason: room.undo.stale ? room.undo.staleReason : null
+        }
+      : null,
     logs: room.logs.slice(-200)
   };
 }
@@ -240,11 +256,39 @@ function send(ws, obj) {
 function commit(room) {
   room.version += 1;
   room.lastSeen = Date.now();
+  // 任何版本化状态变更都会使未消费的撤销记录立即失效
+  if (room.undo && !room.undo.stale && room.undo.version !== room.version) {
+    room.undo.stale = true;
+    room.undo.staleReason = '此后发生了新的状态变更';
+  }
   const snap = { type: 'snapshot', snapshot: buildSnapshot(room) };
   const data = JSON.stringify(snap);
   for (const p of room.participants.values()) {
     if (p.ws && p.ws.readyState === OPEN) p.ws.send(data);
   }
+}
+
+/**
+ * 安全撤销：为主持人操作记录结构化逆操作。
+ * 必须在状态修改完成后、commit 之前调用——version 绑定操作完成后的版本，
+ * 此后任何版本化状态变更（见 commit）都会使其失效。
+ * 逆操作只覆盖队列位置与当前发言：成员在线状态、身份凭证与既有操作记录
+ * 不属于撤销范围。发言计时以已发言时长（elapsedMs）记录，撤销时折算新的
+ * startedAt，计时连续而不会把"已结束"的间隔算进去。
+ */
+function recordUndo(room, summary, prevOrder, prevSpeaking) {
+  room.undo = {
+    version: room.version + 1,
+    summary,
+    inverse: {
+      order: prevOrder.slice(),
+      speaking: prevSpeaking
+        ? { id: prevSpeaking.id, elapsedMs: Date.now() - prevSpeaking.startedAt }
+        : null
+    },
+    stale: false,
+    staleReason: null
+  };
 }
 
 function sendError(ws, message, code, room) {
@@ -334,6 +378,7 @@ wss.on('connection', (ws) => {
         case 'remove':
         case 'clear':
         case 'clear_logs':
+        case 'undo':
           return handleCommand(ws, msg, room, pid, isHost);
 
         default:
@@ -713,6 +758,8 @@ function handleCommand(ws, msg, room, pid, isHost) {
       const target = room.participants.get(targetId);
       if (!target) return sendError(ws, '参与者不存在', 'NO_PARTICIPANT', room);
 
+      const prevOrder = room.order.slice();
+      const prevSpeaking = room.speaking;
       if (room.speaking) {
         const prev = room.participants.get(room.speaking.id);
         room.speaking = null;
@@ -725,6 +772,7 @@ function handleCommand(ws, msg, room, pid, isHost) {
       }
       room.speaking = { id: targetId, startedAt: Date.now() };
       addLog(room, 'talk', `主持人请「${target.nick}」开始发言`);
+      recordUndo(room, `请「${target.nick}」开始发言`, prevOrder, prevSpeaking);
       return commit(room);
     }
 
@@ -732,8 +780,11 @@ function handleCommand(ws, msg, room, pid, isHost) {
       if (!guardVersion(ws, msg, room) || !requireHost(ws, room, isHost)) return;
       if (!room.speaking) return sendError(ws, '当前没有人发言', 'NO_SPEAKER', room);
       const speaker = room.participants.get(room.speaking.id);
+      const prevOrder = room.order.slice();
+      const prevSpeaking = room.speaking;
       room.speaking = null;
       addLog(room, 'talk', `主持人结束「${speaker ? speaker.nick : '已离开'}」的发言`);
+      recordUndo(room, `结束「${speaker ? speaker.nick : '已离开'}」的发言`, prevOrder, prevSpeaking);
       return commit(room);
     }
 
@@ -754,10 +805,13 @@ function handleCommand(ws, msg, room, pid, isHost) {
       }
       const same = incoming.length === room.order.length && incoming.every((id, i) => id === room.order[i]);
       if (same) return sendError(ws, '顺序没有变化', 'NO_CHANGE', room);
+      const prevOrder = room.order.slice();
+      const prevSpeaking = room.speaking;
       room.order = incoming;
       // 主持人重排后，所有待处理换位邀请均作废，需重新发起
       invalidateSwaps(room, 'reordered');
       addLog(room, 'queue', '主持人调整了发言顺序');
+      recordUndo(room, '调整发言顺序', prevOrder, prevSpeaking);
       return commit(room);
     }
 
@@ -766,11 +820,14 @@ function handleCommand(ws, msg, room, pid, isHost) {
       const targetId = String(msg.participantId || '');
       const target = room.participants.get(targetId);
       if (!target) return sendError(ws, '参与者不存在', 'NO_PARTICIPANT', room);
+      const prevOrder = room.order.slice();
+      const prevSpeaking = room.speaking;
       const idx = room.order.indexOf(targetId);
       if (idx !== -1) room.order.splice(idx, 1);
       if (room.speaking?.id === targetId) room.speaking = null;
       invalidateSwaps(room, 'removed', (s) => s.from === targetId || s.to === targetId);
       addLog(room, 'queue', `主持人将「${target.nick}」移出队列`);
+      recordUndo(room, `将「${target.nick}」移出队列`, prevOrder, prevSpeaking);
       return commit(room);
     }
 
@@ -779,6 +836,7 @@ function handleCommand(ws, msg, room, pid, isHost) {
       room.order = [];
       room.speaking = null;
       room.logs = [];
+      room.undo = null; // 状态已重置，撤销记录一并作废
       invalidateSwaps(room, 'cleared');
       addLog(room, 'system', '主持人执行了一键清空（队列、当前发言、操作记录已重置）');
       return commit(room);
@@ -788,6 +846,33 @@ function handleCommand(ws, msg, room, pid, isHost) {
       if (!guardVersion(ws, msg, room) || !requireHost(ws, room, isHost)) return;
       room.logs = [];
       addLog(room, 'system', '主持人清空了操作记录');
+      return commit(room);
+    }
+
+    case 'undo': {
+      if (!guardVersion(ws, msg, room) || !requireHost(ws, room, isHost)) return;
+      const undo = room.undo;
+      if (!undo) {
+        return sendError(ws, '当前没有可撤销的操作', 'UNDO_NOT_AVAILABLE', room);
+      }
+      if (undo.stale || undo.version !== room.version) {
+        return sendError(ws, '该操作已被后续变更覆盖，无法撤销', 'UNDO_EXPIRED', room);
+      }
+      // 防御：相关成员仍在房间（正常流程下任何成员变动都会先使撤销失效）
+      const restorable =
+        undo.inverse.order.every((id) => room.participants.has(id)) &&
+        (!undo.inverse.speaking || room.participants.has(undo.inverse.speaking.id));
+      if (!restorable) {
+        return sendError(ws, '相关成员已变化，无法撤销', 'UNDO_EXPIRED', room);
+      }
+      // 原子恢复：同一同步块内还原受影响的队列位置与当前发言；
+      // 不触碰成员在线状态、身份凭证与既有操作记录，仅追加一条审计记录
+      room.order = undo.inverse.order.slice();
+      room.speaking = undo.inverse.speaking
+        ? { id: undo.inverse.speaking.id, startedAt: Date.now() - undo.inverse.speaking.elapsedMs }
+        : null;
+      room.undo = null; // 记录即被消费，不支持嵌套撤销
+      addLog(room, 'undo', `主持人撤销操作：${undo.summary}`);
       return commit(room);
     }
   }

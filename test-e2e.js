@@ -392,6 +392,126 @@ async function main() {
   bob2.send({ type: 'swap_accept', version: bob2.v, swapId: 'sw_not_exist' });
   await bob2.waitFor((c) => c.lastError && c.lastError.code === 'NO_SWAP');
 
+  // ===========================================================================
+  // 安全撤销（主持人最近操作的结构化逆操作）
+  // ===========================================================================
+
+  // 16a. 准备：bob、carol 归队 -> [alice, bob, carol]
+  bob2.send({ type: 'request_speak', version: bob2.v });
+  await host.waitFor((c) => c.snapshot.order.length === 2);
+  carol.send({ type: 'request_speak', version: carol.v });
+  await host.waitFor((c) => c.snapshot.order.length === 3);
+  assert.deepStrictEqual(host.snapshot.order, [aliceId, bobId, carolId]);
+
+  // 16b. 拖动排序（reorder）的逆操作：恢复拖动前顺序，追加审计记录
+  host.send({ type: 'reorder', version: host.v, order: [carolId, aliceId, bobId] });
+  await host.waitFor((c) => c.snapshot.order[0] === carolId);
+  assert.deepStrictEqual(host.snapshot.order, [carolId, aliceId, bobId]);
+  assert.ok(host.snapshot.undo && host.snapshot.undo.available, 'reorder 后快照应携带可撤销摘要');
+  assert.match(host.snapshot.undo.summary, /顺序/);
+
+  const onlineBefore = host.snapshot.participants.map((p) => [p.id, p.online]);
+  host.send({ type: 'undo', version: host.v });
+  await host.waitFor((c) => c.snapshot.order[0] === aliceId && c.snapshot.order.length === 3);
+  assert.deepStrictEqual(host.snapshot.order, [aliceId, bobId, carolId], '撤销应恢复拖动前顺序');
+  assert.strictEqual(host.snapshot.undo, null, '撤销记录被消费，不可嵌套撤销');
+  const undoLog = host.snapshot.logs[host.snapshot.logs.length - 1];
+  assert.strictEqual(undoLog.kind, 'undo', '撤销应追加可见审计记录');
+  assert.match(undoLog.text, /撤销/);
+  assert.deepStrictEqual(
+    host.snapshot.participants.map((p) => [p.id, p.online]),
+    onlineBefore,
+    '撤销不得回滚成员在线状态'
+  );
+
+  // 不可嵌套撤销
+  host.lastError = null;
+  host.send({ type: 'undo', version: host.v });
+  await host.waitFor((c) => c.lastError && c.lastError.code === 'UNDO_NOT_AVAILABLE');
+
+  // 16c. 介入变更边界：撤销可用后任何版本化变更使其立即失效
+  host.send({ type: 'reorder', version: host.v, order: [bobId, aliceId, carolId] });
+  await host.waitFor((c) => c.snapshot.undo && c.snapshot.undo.available === true);
+  bob2.send({ type: 'cancel_speak', version: bob2.v }); // 参与者的版本化介入变更
+  await host.waitFor((c) => c.snapshot.undo && c.snapshot.undo.available === false);
+  assert.ok(host.snapshot.undo.reason, '快照应携带失效原因');
+  host.lastError = null;
+  host.send({ type: 'undo', version: host.v });
+  await host.waitFor((c) => c.lastError && c.lastError.code === 'UNDO_EXPIRED');
+  assert.strictEqual(host.lastError.snapshot.version, host.snapshot.version, '失效撤销应返回最新快照');
+  assert.deepStrictEqual(host.snapshot.order, [aliceId, carolId], '失效的撤销不得改动状态');
+  // bob 归队 -> [alice, carol, bob]
+  bob2.send({ type: 'request_speak', version: bob2.v });
+  await host.waitFor((c) => c.snapshot.order.length === 3);
+  assert.deepStrictEqual(host.snapshot.order, [aliceId, carolId, bobId]);
+
+  // 16d. 移出队列（remove）的逆操作：被移除者回到原位置
+  host.send({ type: 'remove', version: host.v, participantId: bobId });
+  await host.waitFor((c) => c.snapshot.order.length === 2);
+  assert.deepStrictEqual(host.snapshot.order, [aliceId, carolId]);
+  assert.ok(host.snapshot.undo && host.snapshot.undo.available);
+  host.send({ type: 'undo', version: host.v });
+  await host.waitFor((c) => c.snapshot.order.length === 3);
+  assert.deepStrictEqual(host.snapshot.order, [aliceId, carolId, bobId], '撤销应把被移除者放回原位置');
+
+  // 16e. 开始发言（start_speaking）的逆操作：恢复队列位置与上一发言人
+  host.send({ type: 'start_speaking', version: host.v, participantId: aliceId });
+  await host.waitFor((c) => c.snapshot.speaking && c.snapshot.speaking.id === aliceId);
+  assert.deepStrictEqual(host.snapshot.order, [carolId, bobId]);
+  const aliceStartedAt = host.snapshot.speaking.startedAt;
+
+  host.send({ type: 'start_speaking', version: host.v, participantId: carolId });
+  await host.waitFor((c) => c.snapshot.speaking && c.snapshot.speaking.id === carolId);
+  assert.deepStrictEqual(host.snapshot.order, [bobId]);
+  assert.ok(host.snapshot.undo && host.snapshot.undo.available);
+
+  host.send({ type: 'undo', version: host.v });
+  await host.waitFor((c) => c.snapshot.speaking && c.snapshot.speaking.id === aliceId);
+  assert.deepStrictEqual(host.snapshot.order, [carolId, bobId], '撤销应恢复被请出发言者的队列位置');
+  assert.ok(
+    host.snapshot.speaking.startedAt >= aliceStartedAt,
+    '撤销恢复发言时计时连续（startedAt 经补偿，不早于原值）'
+  );
+
+  // 16f. 结束发言（end_speaking）的逆操作：恢复当前发言
+  host.send({ type: 'end_speaking', version: host.v });
+  await host.waitFor((c) => c.snapshot.speaking === null);
+  assert.ok(host.snapshot.undo && host.snapshot.undo.available);
+  assert.match(host.snapshot.undo.summary, /结束/);
+  host.send({ type: 'undo', version: host.v });
+  await host.waitFor((c) => c.snapshot.speaking && c.snapshot.speaking.id === aliceId);
+  host.send({ type: 'end_speaking', version: host.v });
+  await host.waitFor((c) => c.snapshot.speaking === null);
+
+  // 16g. remove 当前发言人：撤销同时恢复发言（alice 本不在队列，撤销后也不在）
+  host.send({ type: 'start_speaking', version: host.v, participantId: aliceId });
+  await host.waitFor((c) => c.snapshot.speaking && c.snapshot.speaking.id === aliceId);
+  host.send({ type: 'remove', version: host.v, participantId: aliceId });
+  await host.waitFor((c) => c.snapshot.speaking === null);
+  host.send({ type: 'undo', version: host.v });
+  await host.waitFor((c) => c.snapshot.speaking && c.snapshot.speaking.id === aliceId);
+  assert.ok(!host.snapshot.order.includes(aliceId), 'alice 本不在队列，撤销后也不应在队列');
+  host.send({ type: 'end_speaking', version: host.v });
+  await host.waitFor((c) => c.snapshot.speaking === null);
+
+  // 16h. 过期版本的 undo -> STALE_VERSION 且携带最新快照，撤销记录不被消费
+  host.send({ type: 'reorder', version: host.v, order: [bobId, carolId] });
+  await host.waitFor((c) => c.snapshot.undo && c.snapshot.undo.available === true);
+  host.lastError = null;
+  host.send({ type: 'undo', version: host.v - 1 });
+  await host.waitFor((c) => c.lastError && c.lastError.code === 'STALE_VERSION');
+  assert.strictEqual(host.lastError.snapshot.version, host.snapshot.version);
+  assert.ok(host.snapshot.undo && host.snapshot.undo.available, 'STALE_VERSION 不得消费撤销记录');
+
+  // 16i. 非主持人不能撤销
+  alice.lastError = null;
+  alice.send({ type: 'undo', version: alice.v });
+  await alice.waitFor((c) => c.lastError && c.lastError.code === 'FORBIDDEN');
+
+  // 收尾：撤销 reorder，恢复 [carol, bob]
+  host.send({ type: 'undo', version: host.v });
+  await host.waitFor((c) => c.snapshot.order[0] === carolId && c.snapshot.order.length === 2);
+
   await dave.close();
 
   // 15. 房间不存在

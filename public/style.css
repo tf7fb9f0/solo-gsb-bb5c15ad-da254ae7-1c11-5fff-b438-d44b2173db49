@@ -467,6 +467,43 @@ body.role-participant .swap-bar { display: flex; }
 .swap-card-desc { color: var(--text-dim); font-size: 14px; word-break: break-all; }
 .swap-card-actions { display: flex; gap: 8px; flex-shrink: 0; }
 
+/* ===== 安全撤销（主持人） ===== */
+.undo-bar {
+  display: none;
+  margin-top: 12px;
+  flex-shrink: 0;
+}
+
+body.role-host .undo-bar { display: block; }
+
+.undo-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-radius: 10px;
+  padding: 8px 14px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  font-size: 14px;
+  animation: pop 0.2s ease;
+}
+
+.undo-card.is-stale { opacity: 0.65; }
+
+.undo-desc {
+  color: var(--text-dim);
+  min-width: 0;
+  word-break: break-all;
+}
+
+.undo-stale {
+  color: var(--warning);
+  font-size: 13px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
 .queue-empty {
   flex: 1;
   display: flex;
@@ -522,6 +559,7 @@ body.role-participant .swap-bar { display: flex; }
 .log-item.kind-system { color: var(--accent); }
 .log-item.kind-presence { color: #7dd3fc; }
 .log-item.kind-swap { color: #c4b5fd; }
+.log-item.kind-undo { color: var(--warning); }
 
 .people-item {
   display: flex;
