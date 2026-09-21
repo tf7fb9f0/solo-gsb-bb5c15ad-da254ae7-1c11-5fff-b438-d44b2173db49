@@ -1,0 +1,17 @@
+services:
+  speak-queue:
+    build: .
+    image: speak-queue:latest
+    container_name: speak-queue
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      # 容器内监听端口（左侧宿主机映射端口可用 PORT 变量覆盖）
+      PORT: "3000"
+      HOST: "0.0.0.0"
+      WS_PATH: "/ws"
+      # 全员离线后房间保留时长（毫秒），默认 4 小时
+      ROOM_TTL_MS: "14400000"
+      # 服务端保留的操作记录上限
+      LOG_LIMIT: "500"
+    restart: unless-stopped
